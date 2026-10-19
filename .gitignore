@@ -1,0 +1,10 @@
+.env
+__pycache__/
+output/
+.deepnote/
+.vscode/
+.idea/
+.deepeval/
+.pytest_cache/
+.pdf
+data/

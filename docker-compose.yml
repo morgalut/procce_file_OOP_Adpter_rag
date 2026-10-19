@@ -1,0 +1,55 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+    ports:
+      - "127.0.0.1:5050:80"
+    depends_on:
+      - db
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+
+
+
+  # api:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   restart: unless-stopped
+  #   environment:
+  #     DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-qbr}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-qbr_db}
+  #     OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OPENAI_API_KEY in .env}
+  #     LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+  #     LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+  #     QBR_PIPELINE_FACTORY: ${QBR_PIPELINE_FACTORY:-qbr.bootstrap.pipeline_factory:create_pipeline}
+  #     QBR_VECTOR_ENABLED: ${QBR_VECTOR_ENABLED:-true}
+  #     QBR_UPLOAD_DIR: /app/data/uploads
+  #     QBR_HOST: 0.0.0.0
+  #     QBR_PORT: 8000
+  #     QBR_RELOAD: "0"
+  #   ports:
+  #     - "127.0.0.1:${QBR_PORT:-8000}:8000"
+  #   volumes:
+  #     - qbr_uploads:/app/data/uploads
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+
+volumes:
+  postgres_data:
+  pgadmin_data:
+  # qbr_uploads:
