@@ -13,6 +13,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from pydantic import ValidationError
+
 from qbr.adapters.pdf.pdf_processing_adapter import CleanDocumentFragment, PDFProcessingAdapter
 from qbr.domain.models import QBRMetadata
 from qbr.adapters.llm.grounding import MetadataGrounder, TableGrounder, GroundingError
@@ -44,6 +46,41 @@ class LLMExtractionSettings:
 
 class MetadataExtractionError(RuntimeError):
     """LLM request or structured response could not be processed."""
+
+
+class StructuredOutputError(MetadataExtractionError):
+    """The provider returned data that cannot satisfy QBRMetadata."""
+
+
+class LLMProviderError(MetadataExtractionError):
+    """Provider request failed; not safe to classify as invalid schema."""
+
+
+def _is_schema_failure(exc: BaseException) -> bool:
+    """Inspect exception causes and Instructor's per-attempt failures.
+
+    Do not classify by error-message substrings. Unknown retry failures
+    remain provider errors rather than being silently skipped.
+    """
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ValidationError):
+            return True
+        for nested in (current.__cause__, current.__context__):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+        attempts = getattr(current, "failed_attempts", None)
+        if isinstance(attempts, (tuple, list)):
+            for attempt in attempts:
+                error = getattr(attempt, "exception", None)
+                if isinstance(error, BaseException):
+                    pending.append(error)
+    return False
 
 
 class EvidenceVerificationError(MetadataExtractionError):
@@ -345,12 +382,20 @@ class InstructorMetadataAdapter:
                 # Extra fields must be forbidden by QBRMetadata itself.
                 metadata = response_model.model_validate(result)
 
+            except ValidationError as exc:
+                raise StructuredOutputError(
+                    "LLM output does not conform to QBRMetadata"
+                ) from exc
             except Exception as exc:
-                # Do not silently remove unknown fields or accept malformed JSON.
-                # Instructor owns response parsing and its configured retries.
-                raise MetadataExtractionError(
-                    "LLM response failed structured metadata extraction "
-                    "or QBRMetadata schema validation"
+                # Instructor retry exhaustion can wrap Pydantic errors.
+                # Never classify unrelated transport/provider errors as
+                # recoverable malformed output.
+                if _is_schema_failure(exc):
+                    raise StructuredOutputError(
+                        "LLM exhausted schema-validation retries"
+                    ) from exc
+                raise LLMProviderError(
+                    f"LLM request failed ({type(exc).__name__})"
                 ) from exc
 
             # 7. Verify that the evidence exists in the original fragment.

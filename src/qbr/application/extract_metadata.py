@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from qbr.adapters.pdf.pdf_processing_adapter import CleanDocumentFragment
-from qbr.adapters.llm.instructor_adapter import EvidenceVerificationError
+from qbr.adapters.llm.instructor_adapter import EvidenceVerificationError, StructuredOutputError
 from qbr.domain.metadata_accumulator import (
     AccumulationResult,
     Fragment,
@@ -194,10 +194,13 @@ class ExtractMetadata:
                     if fragment.document_id != source.document_id or fragment.page_number != page.page_number:
                         raise ValueError("preprocessor returned inconsistent document/page provenance")
                     fragment_id = f"page-{page.page_number:06d}-fragment-{fragment.fragment_index:06d}"
-                    # Both missing evidence and failed quote/source verification are
-                    # recoverable grounding failures. Never retry unrelated API errors.
+                    # Schema/grounding failures are recoverable per fragment.
+                    # Provider errors, unexpected errors, and provenance errors
+                    # remain fatal; never silently convert outages to success.
                     response = None
-                    grounding_error: MissingEvidenceError | EvidenceVerificationError | None = None
+                    recoverable_error: (
+                        MissingEvidenceError | EvidenceVerificationError | StructuredOutputError | None
+                    ) = None
                     fallback_used = False
                     try:
                         candidate = await self._generator.generate_clean_fragment(fragment)
@@ -205,15 +208,19 @@ class ExtractMetadata:
                         require_claim_evidence(candidate.metadata)
                         response = candidate
                     except ProvenanceMismatchError as exc:
-                        raise ExtractionPipelineError(source.document_id, "pdf_or_limits", f"{fragment_id}: {exc}") from exc
-                    except (MissingEvidenceError, EvidenceVerificationError) as exc:
-                        grounding_error = exc
+                        raise ExtractionPipelineError(
+                            source.document_id, "pdf_or_limits", f"{fragment_id}: {exc}"
+                        ) from exc
+                    except (MissingEvidenceError, EvidenceVerificationError, StructuredOutputError) as exc:
+                        recoverable_error = exc
                     except ExtractionPipelineError:
                         raise
                     except Exception as exc:
-                        raise ExtractionPipelineError(source.document_id, "llm", f"{fragment_id}: {exc}") from exc
+                        raise ExtractionPipelineError(
+                            source.document_id, "llm", f"{fragment_id}: {exc}"
+                        ) from exc
 
-                    if grounding_error is not None and self._fallback_generator is not None:
+                    if recoverable_error is not None and self._fallback_generator is not None:
                         try:
                             candidate = await self._fallback_generator.generate_clean_fragment(fragment)
                             self._check_response(candidate, source.document_id, page.page_number)
@@ -221,30 +228,42 @@ class ExtractMetadata:
                             response = candidate
                             fallback_used = True
                         except ProvenanceMismatchError as exc:
-                            raise ExtractionPipelineError(source.document_id, "pdf_or_limits", f"{fragment_id}: {exc}") from exc
-                        except (MissingEvidenceError, EvidenceVerificationError) as exc:
-                            grounding_error = MissingEvidenceError(
-                                f"primary: {grounding_error}; fallback: {exc}"
-                            )
+                            raise ExtractionPipelineError(
+                                source.document_id, "pdf_or_limits", f"{fragment_id}: {exc}"
+                            ) from exc
+                        except (MissingEvidenceError, EvidenceVerificationError, StructuredOutputError) as exc:
+                            # Preserve the primary category for observability,
+                            # unless the fallback also failed schema validation.
+                            if isinstance(exc, StructuredOutputError):
+                                recoverable_error = exc
                         except ExtractionPipelineError:
                             raise
                         except Exception as exc:
-                            # A fallback outage does not destroy other extracted facts.
-                            grounding_error = MissingEvidenceError(
-                                f"primary: {grounding_error}; fallback unavailable: {type(exc).__name__}"
-                            )
+                            # An unavailable fallback is an infrastructure failure,
+                            # not evidence that the document is invalid.
+                            raise ExtractionPipelineError(
+                                source.document_id, "llm_fallback", f"{fragment_id}: {exc}"
+                            ) from exc
 
                     if response is None:
                         incomplete = True
-                        code = ("evidence_verification_failed" if isinstance(grounding_error, EvidenceVerificationError)
-                                else "missing_or_invalid_evidence")
+                        if isinstance(recoverable_error, StructuredOutputError):
+                            code = "invalid_llm_schema"
+                        elif isinstance(recoverable_error, EvidenceVerificationError):
+                            code = "evidence_verification_failed"
+                        else:
+                            code = "missing_or_invalid_evidence"
                         outcomes.append(FragmentOutcome(
                             fragment_id=fragment_id,
                             page_number=page.page_number,
                             fragment_index=fragment.fragment_index,
-                            warnings=(code, "fallback_exhausted" if self._fallback_generator else "fallback_not_configured"),
+                            warnings=(
+                                code,
+                                "fallback_exhausted" if self._fallback_generator
+                                else "fallback_not_configured",
+                            ),
                             validation=None,
-                            error=str(grounding_error),
+                            error=f"{type(recoverable_error).__name__}: {recoverable_error}",
                             failure_code=code,
                         ))
                         continue
