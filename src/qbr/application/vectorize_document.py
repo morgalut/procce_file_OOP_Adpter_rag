@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import isfinite
 from typing import Any, Protocol, Sequence
+from qbr.infrastructure.event_tracking import stage
 
 
 class Embedder(Protocol):
@@ -50,9 +51,11 @@ class VectorizeDocument:
             texts = [getattr(c, "text") for c in batch]
             if any(not isinstance(t, str) or not t.strip() for t in texts):
                 raise ValueError("cannot embed empty chunks")
-            vectors = await self.embedder.embed(texts)
-            if len(vectors) != len(batch):
-                raise ValueError("embedding count mismatch")
+            async with stage("embedding.batch", input_summary={"batch_index": start // self.batch_size, "input_count": len(batch), "model": self.model}) as details:
+                vectors = await self.embedder.embed(texts)
+                if len(vectors) != len(batch):
+                    raise ValueError("embedding count mismatch")
+                details.finish(vector_count=len(vectors), dimensions=len(vectors[0]) if vectors else 0)
             for idx, (chunk, vector) in enumerate(zip(batch, vectors, strict=True)):
                 if not vector or any(not isinstance(v, (int, float)) or not isfinite(v) for v in vector):
                     raise ValueError("embedding contains invalid values")

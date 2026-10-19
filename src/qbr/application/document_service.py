@@ -8,6 +8,7 @@ from qbr.ports.document_storage import DocumentStorage, UploadRejected
 from qbr.ports.pdf_extractor import PDFSource
 from qbr.ports.extraction_store import ExtractionRecord, ExtractionStore
 from qbr.application.process_document import ProcessDocument
+from qbr.infrastructure.event_tracking import run_scope, stage
 
 class ExtractionPipeline(Protocol):
     async def execute(self, source: PDFSource) -> Any: ...
@@ -26,9 +27,10 @@ class DocumentService:
     def __init__(self, *, pipeline: ExtractionPipeline, persistence: PersistenceService,
                  store: ExtractionStore, storage: DocumentStorage,
                  max_pdf_bytes: int = 20 * 1024 * 1024,
-                 processor: ProcessDocument | None = None):
+                 processor: ProcessDocument | None = None, tracker: Any = None):
         if max_pdf_bytes < 5:
             raise ValueError('max_pdf_bytes must be at least 5')
+        self.tracker = tracker
         self.pipeline = pipeline
         self.persistence = persistence
         self.store = store
@@ -47,9 +49,17 @@ class DocumentService:
         if not name.lower().endswith('.pdf'):
             raise UploadRejected('unsupported_media', 'Expected .pdf filename')
         document_id = str(uuid4())
-        stored = await self.storage.save_pdf(document_id, content, max_bytes=self.max_pdf_bytes)
+        if self.tracker is not None:
+            async with run_scope(self.tracker, "document_upload", document_id):
+                return await self._upload_tracked(document_id, name, content)
+        return await self._upload_tracked(document_id, name, content)
+
+    async def _upload_tracked(self, document_id: str, name: str, content: AsyncIterable[bytes]) -> ExtractionRecord:
+        async with stage("storage.save_pdf"):
+            stored = await self.storage.save_pdf(document_id, content, max_bytes=self.max_pdf_bytes)
         try:
-            record = await self.processor.execute(
+            async with stage("document.process"):
+                record = await self.processor.execute(
                 PDFSource(document_id=document_id, path=Path(stored.uri)),
                 filename=name, sha256=stored.sha256, storage_uri=stored.uri,
             )
@@ -57,7 +67,8 @@ class DocumentService:
                 raise RuntimeError("Persistence returned inconsistent document ID")
             return record
         except BaseException:
-            await self.storage.delete(stored.uri)
+            async with stage("storage.cleanup"):
+                await self.storage.delete(stored.uri)
             raise
 
     async def get(self, document_id: str) -> ExtractionRecord:

@@ -59,3 +59,40 @@ class QBREvidenceRow(Base):
     validation_status: Mapped[str] = mapped_column(String(40), nullable=False)
     document: Mapped[QBRDocumentRow] = relationship(back_populates='evidence')
     __table_args__ = (Index('ix_qbr_evidence_document_field', 'document_id', 'field_path'),)
+
+# Execution history is also described in Alembic revision 0003.
+# Keeping ORM metadata aware of these tables prevents autogenerate dropping them.
+from sqlalchemy import Table, Column, BigInteger, Float
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
+
+pipeline_runs_table = Table(
+    'qbr_pipeline_runs', Base.metadata,
+    Column('id', PGUUID(as_uuid=True), primary_key=True),
+    Column('document_id', Text), Column('pipeline_name', Text, nullable=False),
+    Column('status', String(32), nullable=False),
+    Column('started_at', DateTime(timezone=True), server_default=func.now(), nullable=False),
+    Column('finished_at', DateTime(timezone=True)),
+)
+pipeline_stages_table = Table(
+    'qbr_pipeline_stages', Base.metadata,
+    Column('id', PGUUID(as_uuid=True), primary_key=True),
+    Column('run_id', PGUUID(as_uuid=True), ForeignKey('qbr_pipeline_runs.id', ondelete='CASCADE'), nullable=False),
+    Column('parent_stage_id', PGUUID(as_uuid=True), ForeignKey('qbr_pipeline_stages.id')),
+    Column('stage_name', Text, nullable=False), Column('fragment_id', Text),
+    Column('attempt_number', Integer, nullable=False, server_default='1'),
+    Column('status', String(32), nullable=False),
+    Column('started_at', DateTime(timezone=True), server_default=func.now(), nullable=False),
+    Column('finished_at', DateTime(timezone=True)), Column('duration_ms', Float),
+    Column('input_summary', JSONB, nullable=False, server_default=func.cast('{}', JSONB)),
+    Column('output_summary', JSONB, nullable=False, server_default=func.cast('{}', JSONB)),
+    Column('error_code', String(100)),
+)
+pipeline_events_table = Table(
+    'qbr_pipeline_events', Base.metadata,
+    Column('id', BigInteger, primary_key=True, autoincrement=True),
+    Column('run_id', PGUUID(as_uuid=True), ForeignKey('qbr_pipeline_runs.id', ondelete='CASCADE'), nullable=False),
+    Column('stage_id', PGUUID(as_uuid=True), ForeignKey('qbr_pipeline_stages.id', ondelete='SET NULL')),
+    Column('event_type', String(100), nullable=False),
+    Column('event_data', JSONB, nullable=False, server_default=func.cast('{}', JSONB)),
+    Column('created_at', DateTime(timezone=True), server_default=func.now(), nullable=False),
+)

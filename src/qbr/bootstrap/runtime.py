@@ -15,6 +15,7 @@ from qbr.adapters.storage.local_pdf_storage import LocalPDFStorage
 from qbr.application.document_service import DocumentService
 from qbr.application.persist_extraction import PersistExtraction
 from qbr.infrastructure.database import make_database
+from qbr.infrastructure.event_tracking import PostgresPipelineTracker, TrackedService
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,8 @@ async def api_lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.vector_search = None
 
     try:
+        tracker = PostgresPipelineTracker(sessions) if _enabled("QBR_EVENT_TRACKING", "true") else None
+        app.state.pipeline_tracker = tracker
         store = PostgresExtractionStore(sessions)
         documents = DocumentService(
             pipeline=pipeline,
@@ -78,6 +81,7 @@ async def api_lifespan(app: FastAPI) -> AsyncIterator[None]:
             store=store,
             storage=LocalPDFStorage(Path(os.getenv("QBR_UPLOAD_DIR", "data/uploads"))),
             max_pdf_bytes=int(os.getenv("PDF_MAX_SIZE_MB", "20")) * 1024 * 1024,
+            tracker=tracker,
         )
         app.state.document_service = documents
 
@@ -92,8 +96,8 @@ async def api_lifespan(app: FastAPI) -> AsyncIterator[None]:
                 chunk_max_tokens=int(os.getenv("QBR_CHUNK_MAX_TOKENS", "700")),
                 chunk_overlap_tokens=int(os.getenv("QBR_CHUNK_OVERLAP_TOKENS", "70")),
             )
-            app.state.index_document = index
-            app.state.vector_search = search
+            app.state.index_document = TrackedService(index, "vector_index", tracker, document_arg=True) if tracker else index
+            app.state.vector_search = TrackedService(search, "vector_search", tracker) if tracker else search
             logger.info("QBR vector services initialized")
         else:
             logger.info("QBR vector services disabled (QBR_VECTOR_ENABLED=false)")
@@ -103,4 +107,5 @@ async def api_lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.vector_search = None
         app.state.index_document = None
         app.state.document_service = None
+        app.state.pipeline_tracker = None
         await engine.dispose()

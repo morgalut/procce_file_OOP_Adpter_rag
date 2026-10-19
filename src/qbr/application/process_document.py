@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 from qbr.ports.pdf_extractor import PDFSource
+from qbr.infrastructure.event_tracking import stage
 
 
 class Extractor(Protocol):
@@ -27,8 +28,10 @@ class ProcessDocument:
                       sha256: str, storage_uri: str | None = None) -> Any:
         if not filename.strip() or not sha256.strip():
             raise ValueError("filename and sha256 are required")
-        result = await self.extractor.execute(source)
+        async with stage("document.extract"):
+            result = await self.extractor.execute(source)
         if result.document_id != source.document_id:
             raise DocumentProvenanceError("extraction document provenance mismatch")
-        return await self.persister.execute(result, filename=filename,
+        async with stage("document.persist"):
+            return await self.persister.execute(result, filename=filename,
                                             sha256=sha256, storage_uri=storage_uri)

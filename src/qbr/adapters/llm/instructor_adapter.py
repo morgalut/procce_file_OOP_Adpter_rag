@@ -18,7 +18,11 @@ from pydantic import ValidationError
 from qbr.adapters.pdf.pdf_processing_adapter import CleanDocumentFragment, PDFProcessingAdapter
 from qbr.domain.models import QBRMetadata
 from qbr.adapters.llm.grounding import MetadataGrounder, TableGrounder, GroundingError
-from qbr.adapters.llm.evidence_resolver import EvidenceResolver, SourceReferenceError
+from qbr.adapters.llm.evidence_resolver import (
+    EvidenceResolver,
+    SourceReferenceError,
+    is_supported_quote,
+)
 from qbr.ports.metadata_generator import MetadataExtractionRequest, MetadataExtractionResult
 
 
@@ -283,7 +287,9 @@ class InstructorMetadataAdapter:
                         f"Invalid evidence source_id {evidence.source_id!r} on page "
                         f"{fragment.page_number}: {exc}"
                     ) from exc
-            if not quote or not quote.strip() or not any(quote in source for source in sources):
+            if not quote or not quote.strip() or not any(
+                is_supported_quote(quote, source) for source in sources
+            ):
                 raise EvidenceVerificationError(
                     f"Evidence excerpt not present in fragment on page {fragment.page_number}: "
                     f"{quote[:100]!r}"

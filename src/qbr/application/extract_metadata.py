@@ -21,6 +21,7 @@ from qbr.domain.models import QBRMetadata, ValidationResult
 from qbr.domain.enums import ProcessingStatus, ValidationStatus
 from qbr.ports.metadata_generator import MetadataExtractionResult
 from qbr.ports.pdf_extractor import PDFExtractionOptions, PDFExtractor, PDFSource
+from qbr.infrastructure.event_tracking import stage, emit
 
 
 @runtime_checkable
@@ -177,6 +178,7 @@ class ExtractMetadata:
 
         try:
             async for page in self._extractor.iter_pages(source, options=options):
+                await emit("pdf.page_parsed", {"page_number": page.page_number})
                 if page.page_number <= last_page_number:
                     raise ValueError("PDF extractor returned duplicate or unordered pages")
                 last_page_number = page.page_number
@@ -184,7 +186,8 @@ class ExtractMetadata:
                 if page_count > self._limits.max_pages:
                     raise ValueError("document exceeds max_pages")
                 try:
-                    fragments = self._processor.process_page(source.document_id, page)
+                    async with stage("pdf.preprocess", input_summary={"page": page.page_number}):
+                        fragments = self._processor.process_page(source.document_id, page)
                 except Exception as exc:
                     raise ExtractionPipelineError(source.document_id, "preprocess", str(exc)) from exc
                 for fragment in fragments:
@@ -203,7 +206,9 @@ class ExtractMetadata:
                     ) = None
                     fallback_used = False
                     try:
-                        candidate = await self._generator.generate_clean_fragment(fragment)
+                        async with stage("llm.extract", fragment_id=fragment_id, input_summary={"page_number": page.page_number, "fragment_index": fragment.fragment_index, "table_count": len(fragment.tables), "text_length": len(fragment.text or "")}) as details:
+                            candidate = await self._generator.generate_clean_fragment(fragment)
+                            details.finish(response_received=True)
                         self._check_response(candidate, source.document_id, page.page_number)
                         require_claim_evidence(candidate.metadata)
                         response = candidate
@@ -213,6 +218,7 @@ class ExtractMetadata:
                         ) from exc
                     except (MissingEvidenceError, EvidenceVerificationError, StructuredOutputError) as exc:
                         recoverable_error = exc
+                        await emit("llm.extraction_rejected", {"fragment_id": fragment_id, "error_code": type(exc).__name__})
                     except ExtractionPipelineError:
                         raise
                     except Exception as exc:
@@ -222,7 +228,9 @@ class ExtractMetadata:
 
                     if recoverable_error is not None and self._fallback_generator is not None:
                         try:
-                            candidate = await self._fallback_generator.generate_clean_fragment(fragment)
+                            async with stage("llm.fallback", fragment_id=fragment_id, input_summary={"page_number": page.page_number, "fragment_index": fragment.fragment_index}) as details:
+                                candidate = await self._fallback_generator.generate_clean_fragment(fragment)
+                                details.finish(response_received=True)
                             self._check_response(candidate, source.document_id, page.page_number)
                             require_claim_evidence(candidate.metadata)
                             response = candidate
@@ -232,6 +240,7 @@ class ExtractMetadata:
                                 source.document_id, "pdf_or_limits", f"{fragment_id}: {exc}"
                             ) from exc
                         except (MissingEvidenceError, EvidenceVerificationError, StructuredOutputError) as exc:
+                            await emit("llm.fallback_rejected", {"fragment_id": fragment_id, "error_code": type(exc).__name__})
                             # Preserve the primary category for observability,
                             # unless the fallback also failed schema validation.
                             if isinstance(exc, StructuredOutputError):
@@ -253,6 +262,7 @@ class ExtractMetadata:
                             code = "evidence_verification_failed"
                         else:
                             code = "missing_or_invalid_evidence"
+                        await emit("fragment.rejected", {"fragment_id":fragment_id, "reason":code})
                         outcomes.append(FragmentOutcome(
                             fragment_id=fragment_id,
                             page_number=page.page_number,
@@ -268,12 +278,16 @@ class ExtractMetadata:
                         ))
                         continue
                     try:
-                        fragment_validation = self._validator.validate_fragment(response.metadata)
-                        accumulator.add(Fragment(
+                        async with stage("validation.fragment", fragment_id=fragment_id) as details:
+                            fragment_validation = self._validator.validate_fragment(response.metadata)
+                            details.finish(status=str(fragment_validation.status))
+                        async with stage("metadata.accumulate", fragment_id=fragment_id) as details:
+                            accumulator.add(Fragment(
                             fragment_id=fragment_id,
                             order=fragment_count - 1,
                             metadata=response.metadata,
                         ))
+                            details.finish(accepted=True)
                     except Exception as exc:
                         raise ExtractionPipelineError(source.document_id, "accumulate", f"{fragment_id}: {exc}") from exc
                     outcomes.append(FragmentOutcome(
@@ -292,8 +306,10 @@ class ExtractMetadata:
         if page_count == 0:
             raise ExtractionPipelineError(source.document_id, "pdf", "extractor returned no pages")
         try:
-            snapshot = accumulator.snapshot()
-            validation = self._validator.validate(snapshot.metadata)
+            async with stage("validation.final", input_summary={"page_count": page_count, "fragment_count": fragment_count, "incomplete": incomplete}) as details:
+                snapshot = accumulator.snapshot()
+                validation = self._validator.validate(snapshot.metadata)
+                details.finish(status=str(validation.status), incomplete=incomplete)
         except Exception as exc:
             raise ExtractionPipelineError(source.document_id, "final_validation", str(exc)) from exc
         return DocumentExtractionResult(

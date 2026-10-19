@@ -10,6 +10,7 @@ from typing import Sequence
 from qbr.application.prepare_chunks import PrepareChunks
 from qbr.application.vectorize_document import VectorizeDocument, VectorizedChunk
 from qbr.ports.chunker import ChunkSource
+from qbr.infrastructure.event_tracking import stage
 
 
 @dataclass(frozen=True)
@@ -32,7 +33,9 @@ class PrepareAndVectorize:
     store: object
 
     async def execute(self, document_id: str, sources: Sequence[ChunkSource]) -> tuple[IndexedVector, ...]:
-        chunks = self.prepare.execute(sources, document_id=document_id)
+        async with stage("vector_chunks.prepare", input_summary={"document_id": document_id, "source_count": len(sources)}) as details:
+            chunks = self.prepare.execute(sources, document_id=document_id)
+            details.finish(chunk_count=len(chunks))
         # V19 VectorizeDocument requires chunk_id; V18 TextChunk supplies chunk_index.
         indexed = []
         for chunk in chunks:
@@ -49,7 +52,9 @@ class PrepareAndVectorize:
             text=v.text, embedding=v.embedding, model=v.model,
             section=c.section, page_numbers=c.page_numbers, source_ids=c.source_ids,
         ) for c, v in zip(chunks, vectors, strict=True))
-        await self.store.save_vectors(document_id, output)
+        async with stage("vector_database.save", input_summary={"document_id": document_id, "vector_count": len(output)}) as details:
+            await self.store.save_vectors(document_id, output)
+            details.finish(saved_count=len(output))
         return output
 
 
