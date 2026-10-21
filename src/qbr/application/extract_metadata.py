@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from qbr.adapters.pdf.pdf_processing_adapter import CleanDocumentFragment
-from qbr.adapters.llm.instructor_adapter import EvidenceVerificationError, StructuredOutputError
+from qbr.adapters.llm.instructor_adapter import EvidenceVerificationError
 from qbr.domain.metadata_accumulator import (
     AccumulationResult,
     Fragment,
@@ -21,7 +21,6 @@ from qbr.domain.models import QBRMetadata, ValidationResult
 from qbr.domain.enums import ProcessingStatus, ValidationStatus
 from qbr.ports.metadata_generator import MetadataExtractionResult
 from qbr.ports.pdf_extractor import PDFExtractionOptions, PDFExtractor, PDFSource
-from qbr.infrastructure.event_tracking import stage, emit
 
 
 @runtime_checkable
@@ -175,10 +174,10 @@ class ExtractMetadata:
         fragment_count = 0
         last_page_number = 0
         incomplete = False
+        empty_result_fragments = 0
 
         try:
             async for page in self._extractor.iter_pages(source, options=options):
-                await emit("pdf.page_parsed", {"page_number": page.page_number})
                 if page.page_number <= last_page_number:
                     raise ValueError("PDF extractor returned duplicate or unordered pages")
                 last_page_number = page.page_number
@@ -186,8 +185,7 @@ class ExtractMetadata:
                 if page_count > self._limits.max_pages:
                     raise ValueError("document exceeds max_pages")
                 try:
-                    async with stage("pdf.preprocess", input_summary={"page": page.page_number}):
-                        fragments = self._processor.process_page(source.document_id, page)
+                    fragments = self._processor.process_page(source.document_id, page)
                 except Exception as exc:
                     raise ExtractionPipelineError(source.document_id, "preprocess", str(exc)) from exc
                 for fragment in fragments:
@@ -197,104 +195,102 @@ class ExtractMetadata:
                     if fragment.document_id != source.document_id or fragment.page_number != page.page_number:
                         raise ValueError("preprocessor returned inconsistent document/page provenance")
                     fragment_id = f"page-{page.page_number:06d}-fragment-{fragment.fragment_index:06d}"
-                    # Schema/grounding failures are recoverable per fragment.
-                    # Provider errors, unexpected errors, and provenance errors
-                    # remain fatal; never silently convert outages to success.
+                    # Both missing evidence and failed quote/source verification are
+                    # recoverable grounding failures. Never retry unrelated API errors.
                     response = None
-                    recoverable_error: (
-                        MissingEvidenceError | EvidenceVerificationError | StructuredOutputError | None
-                    ) = None
+                    grounding_error: MissingEvidenceError | EvidenceVerificationError | None = None
                     fallback_used = False
                     try:
-                        async with stage("llm.extract", fragment_id=fragment_id, input_summary={"page_number": page.page_number, "fragment_index": fragment.fragment_index, "table_count": len(fragment.tables), "text_length": len(fragment.text or "")}) as details:
-                            candidate = await self._generator.generate_clean_fragment(fragment)
-                            details.finish(response_received=True)
+                        candidate = await self._generator.generate_clean_fragment(fragment)
                         self._check_response(candidate, source.document_id, page.page_number)
                         require_claim_evidence(candidate.metadata)
                         response = candidate
                     except ProvenanceMismatchError as exc:
-                        raise ExtractionPipelineError(
-                            source.document_id, "pdf_or_limits", f"{fragment_id}: {exc}"
-                        ) from exc
-                    except (MissingEvidenceError, EvidenceVerificationError, StructuredOutputError) as exc:
-                        recoverable_error = exc
-                        await emit("llm.extraction_rejected", {"fragment_id": fragment_id, "error_code": type(exc).__name__})
+                        raise ExtractionPipelineError(source.document_id, "pdf_or_limits", f"{fragment_id}: {exc}") from exc
+                    except (MissingEvidenceError, EvidenceVerificationError) as exc:
+                        grounding_error = exc
                     except ExtractionPipelineError:
                         raise
                     except Exception as exc:
-                        raise ExtractionPipelineError(
-                            source.document_id, "llm", f"{fragment_id}: {exc}"
-                        ) from exc
+                        raise ExtractionPipelineError(source.document_id, "llm", f"{fragment_id}: {exc}") from exc
 
-                    if recoverable_error is not None and self._fallback_generator is not None:
+                    if grounding_error is not None and self._fallback_generator is not None:
                         try:
-                            async with stage("llm.fallback", fragment_id=fragment_id, input_summary={"page_number": page.page_number, "fragment_index": fragment.fragment_index}) as details:
-                                candidate = await self._fallback_generator.generate_clean_fragment(fragment)
-                                details.finish(response_received=True)
+                            candidate = await self._fallback_generator.generate_clean_fragment(fragment)
                             self._check_response(candidate, source.document_id, page.page_number)
                             require_claim_evidence(candidate.metadata)
                             response = candidate
                             fallback_used = True
                         except ProvenanceMismatchError as exc:
-                            raise ExtractionPipelineError(
-                                source.document_id, "pdf_or_limits", f"{fragment_id}: {exc}"
-                            ) from exc
-                        except (MissingEvidenceError, EvidenceVerificationError, StructuredOutputError) as exc:
-                            await emit("llm.fallback_rejected", {"fragment_id": fragment_id, "error_code": type(exc).__name__})
-                            # Preserve the primary category for observability,
-                            # unless the fallback also failed schema validation.
-                            if isinstance(exc, StructuredOutputError):
-                                recoverable_error = exc
+                            raise ExtractionPipelineError(source.document_id, "pdf_or_limits", f"{fragment_id}: {exc}") from exc
+                        except (MissingEvidenceError, EvidenceVerificationError) as exc:
+                            grounding_error = MissingEvidenceError(
+                                f"primary: {grounding_error}; fallback: {exc}"
+                            )
                         except ExtractionPipelineError:
                             raise
                         except Exception as exc:
-                            # An unavailable fallback is an infrastructure failure,
-                            # not evidence that the document is invalid.
-                            raise ExtractionPipelineError(
-                                source.document_id, "llm_fallback", f"{fragment_id}: {exc}"
-                            ) from exc
+                            # A fallback outage does not destroy other extracted facts.
+                            grounding_error = MissingEvidenceError(
+                                f"primary: {grounding_error}; fallback unavailable: {type(exc).__name__}"
+                            )
 
                     if response is None:
                         incomplete = True
-                        if isinstance(recoverable_error, StructuredOutputError):
-                            code = "invalid_llm_schema"
-                        elif isinstance(recoverable_error, EvidenceVerificationError):
-                            code = "evidence_verification_failed"
-                        else:
-                            code = "missing_or_invalid_evidence"
-                        await emit("fragment.rejected", {"fragment_id":fragment_id, "reason":code})
+                        code = ("evidence_verification_failed" if isinstance(grounding_error, EvidenceVerificationError)
+                                else "missing_or_invalid_evidence")
                         outcomes.append(FragmentOutcome(
                             fragment_id=fragment_id,
                             page_number=page.page_number,
                             fragment_index=fragment.fragment_index,
-                            warnings=(
-                                code,
-                                "fallback_exhausted" if self._fallback_generator
-                                else "fallback_not_configured",
-                            ),
+                            warnings=(code, "fallback_exhausted" if self._fallback_generator else "fallback_not_configured"),
                             validation=None,
-                            error=f"{type(recoverable_error).__name__}: {recoverable_error}",
+                            error=str(grounding_error),
                             failure_code=code,
                         ))
                         continue
+                    # Schema-valid empty responses are not proof of successful extraction.
+                    has_claims = any(
+                        getattr(response.metadata, name)
+                        for name in ("customer_name", "reporting_period", "executive_summary",
+                                     "goals", "kpis", "achievements", "challenges", "risks", "next_steps")
+                    )
+                    if fragment.has_content and not has_claims and self._fallback_generator is not None and not fallback_used:
+                        # A schema-valid empty result is not extraction success.
+                        # Recover only through the independently validated fallback,
+                        # without weakening evidence/provenance requirements.
+                        try:
+                            alternative = await self._fallback_generator.generate_clean_fragment(fragment)
+                            self._check_response(alternative, source.document_id, page.page_number)
+                            require_claim_evidence(alternative.metadata)
+                            if any(getattr(alternative.metadata, name) for name in (
+                                "customer_name", "reporting_period", "executive_summary",
+                                "goals", "kpis", "achievements", "challenges", "risks", "next_steps",
+                            )):
+                                response = alternative
+                                fallback_used = True
+                                has_claims = True
+                        except ProvenanceMismatchError as exc:
+                            raise ExtractionPipelineError(source.document_id, "pdf_or_limits", f"{fragment_id}: {exc}") from exc
+                        except Exception:
+                            # Retain the primary empty result for review, not a fabricated success.
+                            pass
+                    if fragment.has_content and not has_claims:
+                        empty_result_fragments += 1
                     try:
-                        async with stage("validation.fragment", fragment_id=fragment_id) as details:
-                            fragment_validation = self._validator.validate_fragment(response.metadata)
-                            details.finish(status=str(fragment_validation.status))
-                        async with stage("metadata.accumulate", fragment_id=fragment_id) as details:
-                            accumulator.add(Fragment(
+                        fragment_validation = self._validator.validate_fragment(response.metadata)
+                        accumulator.add(Fragment(
                             fragment_id=fragment_id,
                             order=fragment_count - 1,
                             metadata=response.metadata,
                         ))
-                            details.finish(accepted=True)
                     except Exception as exc:
                         raise ExtractionPipelineError(source.document_id, "accumulate", f"{fragment_id}: {exc}") from exc
                     outcomes.append(FragmentOutcome(
                         fragment_id=fragment_id,
                         page_number=page.page_number,
                         fragment_index=fragment.fragment_index,
-                        warnings=response.warnings,
+                        warnings=(*response.warnings, *(("empty_metadata_from_nonempty_fragment",) if fragment.has_content and not has_claims else ())),
                         validation=fragment_validation,
                         fallback_used=fallback_used,
                     ))
@@ -303,13 +299,13 @@ class ExtractMetadata:
         except Exception as exc:
             raise ExtractionPipelineError(source.document_id, "pdf_or_limits", str(exc)) from exc
 
+        if empty_result_fragments:
+            incomplete = True
         if page_count == 0:
             raise ExtractionPipelineError(source.document_id, "pdf", "extractor returned no pages")
         try:
-            async with stage("validation.final", input_summary={"page_count": page_count, "fragment_count": fragment_count, "incomplete": incomplete}) as details:
-                snapshot = accumulator.snapshot()
-                validation = self._validator.validate(snapshot.metadata)
-                details.finish(status=str(validation.status), incomplete=incomplete)
+            snapshot = accumulator.snapshot()
+            validation = self._validator.validate(snapshot.metadata)
         except Exception as exc:
             raise ExtractionPipelineError(source.document_id, "final_validation", str(exc)) from exc
         return DocumentExtractionResult(

@@ -1,6 +1,7 @@
 """Central route registry. Register every endpoint exactly once."""
 from fastapi import APIRouter
 from qbr.api.endpoints.documents import router as documents_router
+from qbr.api.endpoints.document_review import router as document_review_router
 from qbr.api.endpoints.execution_history import router as execution_history_router
 from qbr.api.endpoints.health import router as health_router
 from qbr.api.endpoints.vectors import create_qbr_vectors_runtime_router
@@ -12,5 +13,6 @@ def build_api_router() -> APIRouter:
     router.include_router(execution_history_router)
     router.include_router(answer_router)
     router.include_router(documents_router)
+    router.include_router(document_review_router)
     router.include_router(create_qbr_vectors_runtime_router())
     return router

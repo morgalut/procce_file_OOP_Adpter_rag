@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, Awaitable, Callable
 
 from pydantic import ValidationError
 
@@ -36,6 +36,9 @@ class LLMExtractionSettings:
     max_retries: int = 2
     max_input_chars: int = 18_000
     evidence_retries: int = 0  # opt in: bounded extra calls after grounding failure
+    wake_up_enabled: bool = False  # opt-in provider readiness probe
+    wake_up_timeout_seconds: float = 15.0
+    candidate_fallback_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -44,6 +47,8 @@ class LLMExtractionSettings:
             raise ValueError("max_retries must be >= 0")
         if not 0 <= self.evidence_retries <= 3:
             raise ValueError("evidence_retries must be between 0 and 3")
+        if self.wake_up_timeout_seconds <= 0:
+            raise ValueError("wake_up_timeout_seconds must be positive")
         if self.max_input_chars < 500:
             raise ValueError("max_input_chars must be >= 500")
 
@@ -199,11 +204,17 @@ class InstructorMetadataAdapter:
         settings: LLMExtractionSettings,
         processor: PDFProcessingAdapter | None = None,
         grounder: MetadataGrounder | None = None,
+        wake_up_probe: Callable[[], Awaitable[None]] | None = None,
+        fallback_extractor: Any | None = None,
     ) -> None:
         self._completions = completions
         self._settings = settings
         self._processor = processor or PDFProcessingAdapter()
         self._grounder = grounder if grounder is not None else TableGrounder()
+        self._wake_up_probe = wake_up_probe
+        self._fallback_extractor = fallback_extractor
+        self._provider_ready = False
+        self._wake_up_lock = None
 
     @staticmethod
     def _serialize(fragment: CleanDocumentFragment) -> str:
@@ -245,7 +256,7 @@ class InstructorMetadataAdapter:
             "page_number": fragment.page_number,
             "section": fragment.section or "unknown",
             "content_type": fragment.content_type,
-            "source_ids": fragment.source_ids,
+            "source_ids": resolver.available_ids(),
             "text": fragment.text,
             "tables": tables,
         }, ensure_ascii=False, separators=(",", ":"))
@@ -343,6 +354,22 @@ class InstructorMetadataAdapter:
         # Do not maintain a second list of allowed fields.
         response_model = QBRMetadata
 
+        # A readiness probe is opt-in, timeout-bounded, and never fabricates data.
+        # It must be an authenticated provider health call supplied by composition root.
+        if self._settings.wake_up_enabled and not self._provider_ready:
+            if self._wake_up_probe is None:
+                raise LLMProviderError("wake-up enabled but no provider readiness probe configured")
+            import asyncio
+            if self._wake_up_lock is None:
+                self._wake_up_lock = asyncio.Lock()
+            async with self._wake_up_lock:
+                if not self._provider_ready:
+                    try:
+                        await asyncio.wait_for(self._wake_up_probe(), timeout=self._settings.wake_up_timeout_seconds)
+                    except Exception as exc:
+                        raise LLMProviderError("Provider wake-up/readiness probe failed") from exc
+                    self._provider_ready = True
+
         feedback: str | None = None
 
         # 5. Evidence retries are separate from Instructor parsing retries.
@@ -389,20 +416,37 @@ class InstructorMetadataAdapter:
                 metadata = response_model.model_validate(result)
 
             except ValidationError as exc:
-                raise StructuredOutputError(
-                    "LLM output does not conform to QBRMetadata"
-                ) from exc
+                if self._settings.candidate_fallback_enabled and self._fallback_extractor is not None:
+                    try:
+                        metadata = QBRMetadata.model_validate(
+                            await self._fallback_extractor.extract(fragment, content))
+                    except Exception as fallback_exc:
+                        raise StructuredOutputError("Primary schema and candidate fallback both failed") from fallback_exc
+                else:
+                    raise StructuredOutputError(
+                        "LLM output does not conform to QBRMetadata"
+                    ) from exc
             except Exception as exc:
                 # Instructor retry exhaustion can wrap Pydantic errors.
                 # Never classify unrelated transport/provider errors as
                 # recoverable malformed output.
                 if _is_schema_failure(exc):
-                    raise StructuredOutputError(
-                        "LLM exhausted schema-validation retries"
+                    if self._settings.candidate_fallback_enabled and self._fallback_extractor is not None:
+                        # Fallback is an independently validated agent pipeline.
+                        # Its result MUST pass the same evidence and table checks below.
+                        try:
+                            metadata = await self._fallback_extractor.extract(fragment, content)
+                            metadata = QBRMetadata.model_validate(metadata)
+                        except Exception as fallback_exc:
+                            raise StructuredOutputError("Primary schema and candidate fallback both failed") from fallback_exc
+                    else:
+                        raise StructuredOutputError(
+                            "LLM exhausted schema-validation retries"
+                        ) from exc
+                else:
+                    raise LLMProviderError(
+                        f"LLM request failed ({type(exc).__name__})"
                     ) from exc
-                raise LLMProviderError(
-                    f"LLM request failed ({type(exc).__name__})"
-                ) from exc
 
             # 7. Verify that the evidence exists in the original fragment.
             try:

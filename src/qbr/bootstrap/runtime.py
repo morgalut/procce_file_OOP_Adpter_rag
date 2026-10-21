@@ -70,10 +70,14 @@ async def api_lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.document_service = None
     app.state.index_document = None
     app.state.vector_search = None
+    app.state.document_reviewer = None
+    app.state.review_repository = None
 
     try:
         tracker = PostgresPipelineTracker(sessions) if _enabled("QBR_EVENT_TRACKING", "true") else None
         app.state.pipeline_tracker = tracker
+        from qbr.adapters.persistence.review_repository import PostgresReviewRepository
+        app.state.review_repository = PostgresReviewRepository(sessions)
         store = PostgresExtractionStore(sessions)
         documents = DocumentService(
             pipeline=pipeline,
@@ -84,6 +88,15 @@ async def api_lifespan(app: FastAPI) -> AsyncIterator[None]:
             tracker=tracker,
         )
         app.state.document_service = documents
+        review_factory = os.getenv("QBR_DOCUMENT_REVIEW_FACTORY", "").strip()
+        if review_factory:
+            from qbr.bootstrap.document_review_wiring import build_document_review_service
+            app.state.document_reviewer = build_document_review_service(
+                review_factory,
+                max_document_chars=int(os.getenv("QBR_REVIEW_MAX_DOCUMENT_CHARS", "250000")),
+                batch_chars=int(os.getenv("QBR_REVIEW_BATCH_CHARS", "30000")),
+                native_factory_path=os.getenv("QBR_NATIVE_PDF_REVIEW_FACTORY", "").strip(),
+            )
 
         if vector_enabled:
             # Deferred import: document-only deployments do not need vector SDKs.
@@ -105,6 +118,8 @@ async def api_lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         app.state.vector_search = None
+        app.state.document_reviewer = None
+        app.state.review_repository = None
         app.state.index_document = None
         app.state.document_service = None
         app.state.pipeline_tracker = None

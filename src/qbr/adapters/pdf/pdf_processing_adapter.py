@@ -72,6 +72,37 @@ class SectionDetector:
         "quarterly business review": "document_header",
         "executive overview": "executive_overview",
         "executive summary": "executive_overview",
+        "summary": "executive_overview",
+        "account update": "document_header",
+        "current metrics": "performance",
+        "positive developments": "highlights",
+        "adoption": "challenges",
+        "risk / discussion": "risks",
+        "agreed activities": "next_steps",
+        "customer review": "document_header",
+        "review scope": "document_header",
+        "overall status": "executive_overview",
+        "results": "performance",
+        "what went well": "highlights",
+        "items requiring attention": "challenges",
+        "q3 focus": "goals",
+        "follow-up": "next_steps",
+        "qbr notes": "document_header",
+        "numbers mentioned during the review": "performance",
+        "main achievements": "highlights",
+        "issues discussed": "challenges",
+        "customer priorities": "goals",
+        "actions from meeting": "next_steps",
+        "kpi snapshot": "performance",
+        "business impact": "highlights",
+        "concerns": "challenges",
+        "planned activities": "next_steps",
+        "objective check": "goals",
+        "adoption & usage": "performance",
+        "operational metrics": "performance",
+        "discussion": "challenges",
+        "risks / dependencies": "risks",
+        "actions": "next_steps",
         "goals for q2": "goals",
         "goals": "goals",
         "performance": "performance",
@@ -201,7 +232,7 @@ class PDFProcessingAdapter:
             if kind == "text":
                 text, source_id = payload
                 # Blocks can include multiple headings and paragraphs.
-                for line in re.split(r"\n\s*\n|\n(?=(?:Goals for Q[1-4]|Executive Overview|Performance|Highlights|Challenges|Risks|Next Steps)\s*$)", text):
+                for line in text.splitlines():
                     line = line.strip()
                     if not line or self._FOOTER.fullmatch(line) or (" - QBR\nPage " in line and re.search(r"\bPage\s+\d+\s*$", line)):
                         continue
